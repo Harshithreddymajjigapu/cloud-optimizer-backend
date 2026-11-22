@@ -36,6 +36,55 @@ FAKE_ACCOUNT = {
     "subscription_id": "33333333-3333-3333-3333-333333333333",
 }
 
+# Each link test that expects a REJECTION needs a subscription nobody has
+# linked. Reusing FAKE_ACCOUNT's meant that once the happy-path test had run,
+# the duplicate check answered first and the test got the wrong 400 — so these
+# tests only passed in declaration order.
+REJECTED_SUBSCRIPTION = "44444444-0000-0000-0000-000000000001"
+NO_ROLE_SUBSCRIPTION = "44444444-0000-0000-0000-000000000002"
+ENCRYPTED_SUBSCRIPTION = "44444444-0000-0000-0000-000000000003"
+
+
+def account_body(subscription_id):
+    """FAKE_ACCOUNT with a different subscription."""
+    return {**FAKE_ACCOUNT, "subscription_id": subscription_id}
+
+
+@pytest.fixture
+def linked_account():
+    """
+    Guarantee FAKE_ACCOUNT is linked, and return the owning user id.
+
+    The sync tests used to rely on test_link_encrypts_secret_at_rest having run
+    first — one of them said so in its own assertion message. That made the file
+    order-dependent: under pytest-randomly or pytest-xdist it failed, and the
+    failure pointed at the wrong test.
+
+    A fixture states the requirement instead of assuming it.
+    """
+    db = TestingSessionLocal()
+    try:
+        existing = db.query(models.CloudAccount).filter(
+            models.CloudAccount.subscription_id == FAKE_ACCOUNT["subscription_id"]
+        ).first()
+        if existing is not None:
+            return existing.user_id
+    finally:
+        db.close()
+
+    with patch("main.verify_azure_credentials"):
+        response = client.post("/api/v1/accounts/link-azure", json=FAKE_ACCOUNT)
+    assert response.status_code == 201, response.text
+
+    db = TestingSessionLocal()
+    try:
+        account = db.query(models.CloudAccount).filter(
+            models.CloudAccount.subscription_id == FAKE_ACCOUNT["subscription_id"]
+        ).first()
+        return account.user_id
+    finally:
+        db.close()
+
 
 def fake_vm(resource_id, size, location="eastus"):
     """A stand-in for an Azure VM object, with only the fields our code reads."""
@@ -76,7 +125,9 @@ def test_link_rejects_bad_credentials():
             "and client secret, and confirm the secret has not expired."
         ),
     ):
-        response = client.post("/api/v1/accounts/link-azure", json=FAKE_ACCOUNT)
+        response = client.post(
+            "/api/v1/accounts/link-azure", json=account_body(REJECTED_SUBSCRIPTION)
+        )
 
     assert response.status_code == 400
     assert "rejected these credentials" in response.json()["detail"]
@@ -84,7 +135,7 @@ def test_link_rejects_bad_credentials():
     db = TestingSessionLocal()
     try:
         saved = db.query(models.CloudAccount).filter(
-            models.CloudAccount.subscription_id == FAKE_ACCOUNT["subscription_id"]
+            models.CloudAccount.subscription_id == REJECTED_SUBSCRIPTION
         ).first()
         assert saved is None, "a rejected account must not be written to the database"
     finally:
@@ -100,7 +151,9 @@ def test_link_rejects_missing_role():
             "Grant the app registration: Reader and Monitoring Reader."
         ),
     ):
-        response = client.post("/api/v1/accounts/link-azure", json=FAKE_ACCOUNT)
+        response = client.post(
+            "/api/v1/accounts/link-azure", json=account_body(NO_ROLE_SUBSCRIPTION)
+        )
 
     assert response.status_code == 400
     assert "Monitoring Reader" in response.json()["detail"]
@@ -129,10 +182,12 @@ def test_link_rejects_malformed_tenant_id():
 
 def test_link_encrypts_secret_at_rest():
     """A successful link stores ciphertext, never the plaintext secret."""
-    with patch("main.verify_azure_credentials"):
-        response = client.post("/api/v1/accounts/link-azure", json=FAKE_ACCOUNT)
+    body = account_body(ENCRYPTED_SUBSCRIPTION)
 
-    assert response.status_code == 201
+    with patch("main.verify_azure_credentials"):
+        response = client.post("/api/v1/accounts/link-azure", json=body)
+
+    assert response.status_code == 201, response.text
     account_id = response.json()["account_id"]
 
     db = TestingSessionLocal()
@@ -140,11 +195,11 @@ def test_link_encrypts_secret_at_rest():
         saved = db.get(models.CloudAccount, account_id)
 
         # The column must not contain what the user typed...
-        assert saved.client_secret != FAKE_ACCOUNT["client_secret"]
+        assert saved.client_secret != body["client_secret"]
         assert saved.client_secret.startswith("gAAAAA")        # Fernet prefix
 
         # ...but must decrypt back to it.
-        assert decrypt_secret(saved.client_secret) == FAKE_ACCOUNT["client_secret"]
+        assert decrypt_secret(saved.client_secret) == body["client_secret"]
     finally:
         db.close()
 
@@ -157,7 +212,7 @@ def test_response_never_exposes_the_secret():
         assert "client_secret" not in account
 
 
-def test_full_pipeline_writes_an_alert():
+def test_full_pipeline_writes_an_alert(linked_account):
     """
     The whole chain, with only Azure faked:
     linked account -> sync task -> metrics -> CloudResource -> OptimizationAlert.
@@ -165,15 +220,7 @@ def test_full_pipeline_writes_an_alert():
     This is the assertion that never passed before the model-name bug was fixed:
     an alert row actually reaching the database.
     """
-    db = TestingSessionLocal()
-    try:
-        account = db.query(models.CloudAccount).filter(
-            models.CloudAccount.subscription_id == FAKE_ACCOUNT["subscription_id"]
-        ).first()
-        assert account is not None, "run test_link_encrypts_secret_at_rest first"
-        user_id = account.user_id
-    finally:
-        db.close()
+    user_id = linked_account
 
     vms = [
         fake_vm("/subscriptions/33333333/vm-underused", "Standard_D4s_v3"),
@@ -217,17 +264,15 @@ def test_full_pipeline_writes_an_alert():
         db.close()
 
 
-def test_vm_with_no_metrics_is_skipped():
+def test_vm_with_no_metrics_is_skipped(linked_account):
     """
     A deallocated VM returns no datapoints. That must read as 'unknown', not
     'idle' — otherwise every stopped machine gets a downsize recommendation.
     """
+    user_id = linked_account
+
     db = TestingSessionLocal()
     try:
-        account = db.query(models.CloudAccount).filter(
-            models.CloudAccount.subscription_id == FAKE_ACCOUNT["subscription_id"]
-        ).first()
-        user_id = account.user_id
         alerts_before = db.query(models.OptimizationAlert).count()
     finally:
         db.close()
@@ -383,20 +428,13 @@ def test_timespan_has_no_plus_sign():
     assert "." not in timespan, "microseconds are noise at an hourly interval"
 
 
-def test_sync_sends_a_valid_timespan_to_azure():
+def test_sync_sends_a_valid_timespan_to_azure(linked_account):
     """
     Guards the call site, not just the helper. If someone goes back to building
     the timespan inline with isoformat(), this fails even though the helper is
     still correct.
     """
-    db = TestingSessionLocal()
-    try:
-        account = db.query(models.CloudAccount).filter(
-            models.CloudAccount.subscription_id == FAKE_ACCOUNT["subscription_id"]
-        ).first()
-        user_id = account.user_id
-    finally:
-        db.close()
+    user_id = linked_account
 
     compute = MagicMock()
     compute.virtual_machines.list_all.return_value = [
